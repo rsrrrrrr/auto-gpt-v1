@@ -1,0 +1,756 @@
+# requirements.txt
+"""
+fastapi==0.104.1
+uvicorn==0.24.0
+celery==5.3.4
+redis==5.0.1
+openai==1.3.7
+anthropic==0.7.8
+prometheus-client==0.19.0
+docker==6.1.3
+psutil==5.9.6
+websockets==12.0
+aiofiles==23.2.0
+pydantic==2.5.0
+sqlalchemy==2.0.23
+alembic==1.13.0
+httpx==0.25.2
+python-multipart==0.0.6
+"""
+
+# main.py - 메인 시스템
+#!/usr/bin/env python3
+"""
+Production-Ready Enhanced AutoGPT System
+프로덕션 환경용 고급 AutoGPT 시스템
+"""
+
+import asyncio
+import json
+import logging
+import os
+import time
+import uuid
+from datetime import datetime, timedelta
+from typing import Dict, List, Any, Optional, Callable, Union
+from dataclasses import dataclass, asdict, field
+from pathlib import Path
+import signal
+import sys
+
+# FastAPI 및 웹 관련
+from fastapi import FastAPI, HTTPException, WebSocket, Depends, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
+import uvicorn
+
+# Celery 및 Redis
+from celery import Celery
+import redis
+
+# LLM APIs
+import openai
+import anthropic
+
+# 모니터링
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
+import psutil
+
+# 보안 및 샌드박스
+import docker
+import subprocess
+import tempfile
+import shutil
+
+# 데이터베이스
+from sqlalchemy import create_engine, Column, String, DateTime, Float, Integer, Text, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+
+# 기존 시스템 임포트
+from enhanced_autogpt_base import *
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('autogpt_production.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Prometheus 메트릭
+task_counter = Counter('autogpt_tasks_total', 'Total tasks processed', ['status', 'type'])
+task_duration = Histogram('autogpt_task_duration_seconds', 'Task execution time')
+active_goals = Gauge('autogpt_active_goals', 'Number of active goals')
+system_memory = Gauge('autogpt_memory_usage_bytes', 'Memory usage')
+system_cpu = Gauge('autogpt_cpu_usage_percent', 'CPU usage percentage')
+
+# 설정
+class Config:
+    # API Keys
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+    
+    # Redis
+    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    
+    # Database
+    DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///autogpt.db")
+    
+    # Security
+    ENABLE_SANDBOX = os.getenv("ENABLE_SANDBOX", "true").lower() == "true"
+    DOCKER_SANDBOX_IMAGE = os.getenv("DOCKER_SANDBOX_IMAGE", "python:3.11-slim")
+    
+    # Web
+    WEB_PORT = int(os.getenv("WEB_PORT", "8000"))
+    WEB_HOST = os.getenv("WEB_HOST", "0.0.0.0")
+
+config = Config()
+
+# 데이터베이스 모델
+Base = declarative_base()
+
+class GoalModel(Base):
+    __tablename__ = "goals"
+    
+    id = Column(String, primary_key=True)
+    description = Column(Text, nullable=False)
+    success_criteria = Column(Text, nullable=False)  # JSON
+    priority = Column(Integer, default=1)
+    status = Column(String, default="active")
+    created_at = Column(DateTime, default=datetime.now)
+    completed_at = Column(DateTime, nullable=True)
+    deadline = Column(DateTime, nullable=True)
+
+class TaskModel(Base):
+    __tablename__ = "tasks"
+    
+    id = Column(String, primary_key=True)
+    goal_id = Column(String, nullable=False)
+    description = Column(Text, nullable=False)
+    priority = Column(Integer, default=1)
+    estimated_difficulty = Column(Float, default=0.5)
+    dependencies = Column(Text, default="[]")  # JSON
+    status = Column(String, default="pending")
+    result = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.now)
+    completed_at = Column(DateTime, nullable=True)
+
+# LLM 통합 시스템
+class LLMIntegration:
+    """LLM API 통합 (OpenAI + Anthropic)"""
+    
+    def __init__(self):
+        self.openai_client = None
+        self.anthropic_client = None
+        
+        if config.OPENAI_API_KEY:
+            self.openai_client = openai.OpenAI(api_key=config.OPENAI_API_KEY)
+            
+        if config.ANTHROPIC_API_KEY:
+            self.anthropic_client = anthropic.Anthropic(api_key=config.ANTHROPIC_API_KEY)
+        
+        logger.info("LLM 통합 초기화 완료")
+    
+    async def decompose_goal_with_llm(self, goal_description: str, context: str = "") -> List[Dict]:
+        """LLM을 사용한 지능적 목표 분해"""
+        prompt = f"""
+        목표: {goal_description}
+        컨텍스트: {context}
+        
+        이 목표를 달성하기 위한 구체적이고 실행 가능한 작업들로 분해해주세요.
+        각 작업은 다음 형식으로 응답해주세요:
+        
+        [
+          {{
+            "description": "작업 설명",
+            "priority": 1-5 (숫자),
+            "estimated_difficulty": 0.1-1.0 (소수),
+            "dependencies": ["의존하는 작업 설명들"],
+            "tools_needed": ["필요한 도구들"]
+          }}
+        ]
+        
+        JSON 형식으로만 응답해주세요.
+        """
+        
+        try:
+            if self.openai_client:
+                response = await self._query_openai(prompt)
+            elif self.anthropic_client:
+                response = await self._query_anthropic(prompt)
+            else:
+                raise Exception("LLM API가 설정되지 않음")
+            
+            return json.loads(response)
+            
+        except Exception as e:
+            logger.error(f"LLM 목표 분해 실패: {e}")
+            return self._fallback_decomposition(goal_description)
+    
+    async def _query_openai(self, prompt: str) -> str:
+        """OpenAI API 쿼리"""
+        response = await self.openai_client.chat.completions.acreate(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2000,
+            temperature=0.7
+        )
+        return response.choices[0].message.content
+    
+    async def _query_anthropic(self, prompt: str) -> str:
+        """Anthropic API 쿼리"""
+        response = await self.anthropic_client.messages.acreate(
+            model="claude-3-sonnet-20240229",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+    
+    def _fallback_decomposition(self, goal_description: str) -> List[Dict]:
+        """LLM 실패 시 폴백 분해"""
+        return [
+            {
+                "description": f"분석 및 계획: {goal_description}",
+                "priority": 1,
+                "estimated_difficulty": 0.3,
+                "dependencies": [],
+                "tools_needed": ["analysis"]
+            },
+            {
+                "description": f"실행: {goal_description}",
+                "priority": 2,
+                "estimated_difficulty": 0.7,
+                "dependencies": ["분석 및 계획"],
+                "tools_needed": ["execution"]
+            },
+            {
+                "description": f"검증 및 완료: {goal_description}",
+                "priority": 3,
+                "estimated_difficulty": 0.4,
+                "dependencies": ["실행"],
+                "tools_needed": ["validation"]
+            }
+        ]
+
+# 보안 샌드박스 시스템
+class SecuritySandbox:
+    """Docker 기반 보안 샌드박스"""
+    
+    def __init__(self):
+        self.docker_client = None
+        if config.ENABLE_SANDBOX:
+            try:
+                self.docker_client = docker.from_env()
+                logger.info("Docker 샌드박스 초기화 완료")
+            except Exception as e:
+                logger.warning(f"Docker 연결 실패: {e}")
+                self.docker_client = None
+    
+    async def execute_code_safely(self, code: str, language: str = "python", 
+                                 timeout: int = 30) -> Dict[str, Any]:
+        """안전한 코드 실행"""
+        if not self.docker_client:
+            return await self._execute_local_safe(code, language, timeout)
+        
+        try:
+            # 임시 디렉토리 생성
+            with tempfile.TemporaryDirectory() as temp_dir:
+                code_file = Path(temp_dir) / f"code.{self._get_extension(language)}"
+                code_file.write_text(code)
+                
+                # Docker 컨테이너 실행
+                container = self.docker_client.containers.run(
+                    config.DOCKER_SANDBOX_IMAGE,
+                    command=self._get_exec_command(language, "/code/code." + self._get_extension(language)),
+                    volumes={temp_dir: {"bind": "/code", "mode": "ro"}},
+                    network_disabled=True,
+                    mem_limit="128m",
+                    cpu_period=100000,
+                    cpu_quota=50000,  # 50% CPU
+                    detach=True,
+                    remove=True
+                )
+                
+                # 결과 대기
+                result = container.wait(timeout=timeout)
+                logs = container.logs().decode()
+                
+                return {
+                    "success": result["StatusCode"] == 0,
+                    "output": logs,
+                    "exit_code": result["StatusCode"]
+                }
+                
+        except Exception as e:
+            logger.error(f"샌드박스 실행 실패: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def _execute_local_safe(self, code: str, language: str, timeout: int) -> Dict[str, Any]:
+        """로컬 안전 실행 (제한적)"""
+        if language != "python":
+            return {"success": False, "error": "Python만 지원됩니다"}
+        
+        # 위험한 키워드 검사
+        dangerous_keywords = ["import os", "import sys", "__import__", "exec", "eval", "open("]
+        if any(keyword in code for keyword in dangerous_keywords):
+            return {"success": False, "error": "위험한 코드가 감지되었습니다"}
+        
+        try:
+            # 제한된 환경에서 실행
+            restricted_globals = {
+                "__builtins__": {
+                    "print": print,
+                    "len": len,
+                    "str": str,
+                    "int": int,
+                    "float": float,
+                    "list": list,
+                    "dict": dict,
+                    "range": range,
+                    "sum": sum,
+                    "max": max,
+                    "min": min
+                }
+            }
+            
+            exec(code, restricted_globals)
+            return {"success": True, "output": "코드 실행 완료"}
+            
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+    
+    def _get_extension(self, language: str) -> str:
+        extensions = {"python": "py", "javascript": "js", "bash": "sh"}
+        return extensions.get(language, "txt")
+    
+    def _get_exec_command(self, language: str, filepath: str) -> str:
+        commands = {
+            "python": f"python {filepath}",
+            "javascript": f"node {filepath}",
+            "bash": f"bash {filepath}"
+        }
+        return commands.get(language, f"cat {filepath}")
+
+# Celery 설정 및 분산 처리
+celery_app = Celery(
+    "autogpt",
+    broker=config.REDIS_URL,
+    backend=config.REDIS_URL,
+    include=["distributed_tasks"]
+)
+
+celery_app.conf.update(
+    task_serializer="json",
+    accept_content=["json"],
+    result_serializer="json",
+    timezone="UTC",
+    enable_utc=True,
+    task_routes={
+        "execute_task": {"queue": "tasks"},
+        "analyze_performance": {"queue": "analysis"},
+        "llm_process": {"queue": "llm"}
+    }
+)
+
+# 분산 작업 정의
+@celery_app.task(bind=True, max_retries=3)
+def execute_task_distributed(self, task_data: Dict) -> Dict:
+    """분산 작업 실행"""
+    try:
+        task_counter.labels(status="started", type=task_data.get("type", "unknown")).inc()
+        
+        start_time = time.time()
+        
+        # 작업 실행 로직
+        result = _execute_task_logic(task_data)
+        
+        duration = time.time() - start_time
+        task_duration.observe(duration)
+        task_counter.labels(status="completed", type=task_data.get("type", "unknown")).inc()
+        
+        return {"success": True, "result": result, "duration": duration}
+        
+    except Exception as exc:
+        task_counter.labels(status="failed", type=task_data.get("type", "unknown")).inc()
+        logger.error(f"분산 작업 실패: {exc}")
+        
+        # 재시도 로직
+        if self.request.retries < self.max_retries:
+            raise self.retry(countdown=60 * (self.request.retries + 1))
+        
+        return {"success": False, "error": str(exc)}
+
+def _execute_task_logic(task_data: Dict) -> str:
+    """실제 작업 실행 로직"""
+    # 시뮬레이션된 작업 처리
+    time.sleep(1)  # 작업 시뮬레이션
+    return f"작업 완료: {task_data.get('description', 'Unknown task')}"
+
+# 모니터링 시스템
+class MonitoringSystem:
+    """Prometheus 기반 모니터링"""
+    
+    def __init__(self):
+        self.redis_client = redis.from_url(config.REDIS_URL)
+        self._start_metrics_collection()
+    
+    def _start_metrics_collection(self):
+        """메트릭 수집 시작"""
+        asyncio.create_task(self._collect_system_metrics())
+    
+    async def _collect_system_metrics(self):
+        """시스템 메트릭 수집"""
+        while True:
+            try:
+                # CPU 사용률
+                cpu_percent = psutil.cpu_percent()
+                system_cpu.set(cpu_percent)
+                
+                # 메모리 사용률
+                memory = psutil.virtual_memory()
+                system_memory.set(memory.used)
+                
+                # Redis 메트릭
+                redis_info = self.redis_client.info()
+                
+                await asyncio.sleep(10)  # 10초마다 수집
+                
+            except Exception as e:
+                logger.error(f"메트릭 수집 실패: {e}")
+                await asyncio.sleep(30)
+    
+    def get_metrics(self) -> str:
+        """Prometheus 형식 메트릭 반환"""
+        return generate_latest()
+
+# 향상된 AutoGPT 메인 클래스
+class ProductionAutoGPT(EnhancedAutoGPT):
+    """프로덕션 환경용 AutoGPT"""
+    
+    def __init__(self):
+        super().__init__()
+        
+        # 새로운 구성요소들
+        self.llm_integration = LLMIntegration()
+        self.security_sandbox = SecuritySandbox()
+        self.monitoring = MonitoringSystem()
+        
+        # 데이터베이스 설정
+        self.engine = create_engine(config.DATABASE_URL)
+        Base.metadata.create_all(self.engine)
+        self.SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=self.engine)
+        
+        # WebSocket 연결 관리
+        self.websocket_connections: List[WebSocket] = []
+        
+        logger.info("프로덕션 AutoGPT 시스템 초기화 완료")
+    
+    async def add_goal_advanced(self, description: str, success_criteria: List[str], 
+                              priority: int = 1, deadline: Optional[datetime] = None,
+                              use_llm: bool = True) -> str:
+        """고급 목표 추가 (LLM 통합)"""
+        goal_id = str(uuid.uuid4())
+        
+        # 데이터베이스에 목표 저장
+        db = self.SessionLocal()
+        try:
+            goal_model = GoalModel(
+                id=goal_id,
+                description=description,
+                success_criteria=json.dumps(success_criteria),
+                priority=priority,
+                deadline=deadline
+            )
+            db.add(goal_model)
+            db.commit()
+            
+            # LLM을 사용한 작업 분해
+            if use_llm:
+                context = await self._get_relevant_context(description)
+                llm_tasks = await self.llm_integration.decompose_goal_with_llm(description, context)
+                
+                # 작업을 데이터베이스에 저장
+                for i, task_data in enumerate(llm_tasks):
+                    task_model = TaskModel(
+                        id=f"{goal_id}_task_{i}",
+                        goal_id=goal_id,
+                        description=task_data["description"],
+                        priority=task_data["priority"],
+                        estimated_difficulty=task_data["estimated_difficulty"],
+                        dependencies=json.dumps(task_data.get("dependencies", []))
+                    )
+                    db.add(task_model)
+                
+                db.commit()
+            
+            active_goals.inc()
+            
+            # WebSocket으로 업데이트 전송
+            await self._broadcast_update("goal_added", {
+                "goal_id": goal_id,
+                "description": description,
+                "priority": priority
+            })
+            
+            logger.info(f"고급 목표 추가됨: {goal_id} - {description}")
+            return goal_id
+            
+        except Exception as e:
+            db.rollback()
+            raise e
+        finally:
+            db.close()
+    
+    async def _get_relevant_context(self, description: str) -> str:
+        """관련 컨텍스트 검색"""
+        memories = self.memory.search_long_term(description, limit=5)
+        return "\n".join([mem["content"] for mem in memories])
+    
+    async def execute_task_with_sandbox(self, task_id: str) -> bool:
+        """샌드박스를 사용한 안전한 작업 실행"""
+        db = self.SessionLocal()
+        try:
+            task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
+            if not task:
+                return False
+            
+            task.status = "in_progress"
+            db.commit()
+            
+            # 코드 실행이 필요한 작업인지 확인
+            if "코드" in task.description or "실행" in task.description:
+                # 샌드박스에서 안전하게 실행
+                code = self._extract_code_from_description(task.description)
+                if code:
+                    result = await self.security_sandbox.execute_code_safely(code)
+                    task.result = json.dumps(result)
+                    task.status = "completed" if result["success"] else "failed"
+                else:
+                    # 일반 작업 실행
+                    task.result = await self._execute_general_task(task.description)
+                    task.status = "completed"
+            else:
+                # 분산 처리로 전송
+                celery_result = execute_task_distributed.delay({
+                    "id": task_id,
+                    "description": task.description,
+                    "type": self._categorize_task(task.description)
+                })
+                
+                # 결과 대기 (비동기적으로)
+                asyncio.create_task(self._wait_for_celery_result(task_id, celery_result.id))
+                return True
+            
+            task.completed_at = datetime.now()
+            db.commit()
+            
+            return task.status == "completed"
+            
+        except Exception as e:
+            logger.error(f"작업 실행 실패: {e}")
+            task.status = "failed"
+            db.commit()
+            return False
+        finally:
+            db.close()
+    
+    def _extract_code_from_description(self, description: str) -> Optional[str]:
+        """작업 설명에서 코드 추출"""
+        # 간단한 코드 패턴 매칭
+        if "print(" in description:
+            return description
+        return None
+    
+    async def _execute_general_task(self, description: str) -> str:
+        """일반 작업 실행"""
+        await asyncio.sleep(1)  # 시뮬레이션
+        return f"일반 작업 완료: {description}"
+    
+    async def _wait_for_celery_result(self, task_id: str, celery_task_id: str):
+        """Celery 결과 대기"""
+        try:
+            result = celery_app.AsyncResult(celery_task_id)
+            while not result.ready():
+                await asyncio.sleep(1)
+            
+            # 결과를 데이터베이스에 업데이트
+            db = self.SessionLocal()
+            task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
+            if task:
+                celery_result = result.result
+                task.result = json.dumps(celery_result)
+                task.status = "completed" if celery_result.get("success") else "failed"
+                task.completed_at = datetime.now()
+                db.commit()
+            db.close()
+            
+        except Exception as e:
+            logger.error(f"Celery 결과 처리 실패: {e}")
+    
+    async def _broadcast_update(self, event_type: str, data: Dict):
+        """WebSocket 업데이트 브로드캐스트"""
+        if self.websocket_connections:
+            message = json.dumps({"type": event_type, "data": data})
+            for websocket in self.websocket_connections[:]:
+                try:
+                    await websocket.send_text(message)
+                except Exception:
+                    self.websocket_connections.remove(websocket)
+
+# FastAPI 웹 인터페이스
+app = FastAPI(title="Enhanced AutoGPT", version="2.0.0")
+
+# CORS 설정
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 전역 AutoGPT 인스턴스
+autogpt_instance = ProductionAutoGPT()
+
+# 데이터베이스 의존성
+def get_db():
+    db = autogpt_instance.SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# API 엔드포인트
+@app.post("/api/goals")
+async def create_goal(
+    description: str,
+    success_criteria: List[str],
+    priority: int = 1,
+    deadline: Optional[str] = None,
+    use_llm: bool = True
+):
+    """새로운 목표 생성"""
+    deadline_dt = datetime.fromisoformat(deadline) if deadline else None
+    goal_id = await autogpt_instance.add_goal_advanced(
+        description, success_criteria, priority, deadline_dt, use_llm
+    )
+    return {"goal_id": goal_id, "status": "created"}
+
+@app.get("/api/goals")
+async def list_goals(db: Session = Depends(get_db)):
+    """목표 목록 조회"""
+    goals = db.query(GoalModel).all()
+    return [
+        {
+            "id": goal.id,
+            "description": goal.description,
+            "success_criteria": json.loads(goal.success_criteria),
+            "priority": goal.priority,
+            "status": goal.status,
+            "created_at": goal.created_at.isoformat(),
+            "deadline": goal.deadline.isoformat() if goal.deadline else None
+        }
+        for goal in goals
+    ]
+
+@app.get("/api/goals/{goal_id}/tasks")
+async def list_tasks(goal_id: str, db: Session = Depends(get_db)):
+    """목표의 작업 목록 조회"""
+    tasks = db.query(TaskModel).filter(TaskModel.goal_id == goal_id).all()
+    return [
+        {
+            "id": task.id,
+            "description": task.description,
+            "priority": task.priority,
+            "status": task.status,
+            "result": json.loads(task.result) if task.result else None,
+            "created_at": task.created_at.isoformat(),
+            "completed_at": task.completed_at.isoformat() if task.completed_at else None
+        }
+        for task in tasks
+    ]
+
+@app.post("/api/tasks/{task_id}/execute")
+async def execute_task(task_id: str, background_tasks: BackgroundTasks):
+    """작업 실행"""
+    background_tasks.add_task(autogpt_instance.execute_task_with_sandbox, task_id)
+    return {"status": "execution_started"}
+
+@app.get("/api/status")
+async def get_status():
+    """시스템 상태 조회"""
+    return autogpt_instance.get_status()
+
+@app.get("/api/metrics")
+async def get_metrics():
+    """Prometheus 메트릭"""
+    return autogpt_instance.monitoring.get_metrics()
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket 연결"""
+    await websocket.accept()
+    autogpt_instance.websocket_connections.append(websocket)
+    
+    try:
+        while True:
+            await websocket.receive_text()
+    except Exception:
+        pass
+    finally:
+        if websocket in autogpt_instance.websocket_connections:
+            autogpt_instance.websocket_connections.remove(websocket)
+
+# 정적 파일 서빙 (React 프론트엔드용)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+@app.get("/", response_class=HTMLResponse)
+async def read_root():
+    """메인 페이지"""
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Enhanced AutoGPT</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+    </head>
+    <body>
+        <div id="root">
+            <h1>Enhanced AutoGPT System</h1>
+            <p>프로덕션 환경용 고급 AutoGPT 시스템이 실행 중입니다.</p>
+            <p><a href="/docs">API 문서 보기</a></p>
+        </div>
+    </body>
+    </html>
+    """
+
+# 시스템 종료 핸들러
+def signal_handler(signum, frame):
+    logger.info("시스템 종료 신호 수신됨")
+    autogpt_instance.stop()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# 메인 실행
+if __name__ == "__main__":
+    logger.info("프로덕션 AutoGPT 시스템 시작")
+    
+    # 백그라운드에서 목표 처리 시작
+    asyncio.create_task(autogpt_instance.process_goals())
+    
+    # 웹 서버 시작
+    uvicorn.run(
+        "main:app",
+        host=config.WEB_HOST,
+        port=config.WEB_PORT,
+        reload=False,
+        log_level="info"
+    )
