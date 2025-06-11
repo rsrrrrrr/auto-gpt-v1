@@ -1,0 +1,713 @@
+// package.json
+{
+  "name": "autogpt-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@testing-library/jest-dom": "^5.16.4",
+    "@testing-library/react": "^13.3.0",
+    "@testing-library/user-event": "^13.5.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1",
+    "react-router-dom": "^6.8.1",
+    "axios": "^1.3.4",
+    "recharts": "^2.5.0",
+    "socket.io-client": "^4.6.1",
+    "@mui/material": "^5.11.10",
+    "@mui/icons-material": "^5.11.9",
+    "@emotion/react": "^11.10.6",
+    "@emotion/styled": "^11.10.6",
+    "date-fns": "^2.29.3",
+    "react-hot-toast": "^2.4.0"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build",
+    "test": "react-scripts test",
+    "eject": "react-scripts eject"
+  },
+  "eslintConfig": {
+    "extends": [
+      "react-app",
+      "react-app/jest"
+    ]
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  },
+  "proxy": "http://localhost:8000"
+}
+
+// src/App.js
+import React, { useState, useEffect } from 'react';
+import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
+import { ThemeProvider, createTheme } from '@mui/material/styles';
+import { CssBaseline, Box } from '@mui/material';
+import { Toaster } from 'react-hot-toast';
+
+import Dashboard from './components/Dashboard';
+import Goals from './components/Goals';
+import Tasks from './components/Tasks';
+import Monitoring from './components/Monitoring';
+import Settings from './components/Settings';
+import Sidebar from './components/Sidebar';
+import WebSocketService from './services/WebSocketService';
+
+const theme = createTheme({
+  palette: {
+    mode: 'dark',
+    primary: {
+      main: '#2196f3',
+    },
+    secondary: {
+      main: '#f50057',
+    },
+    background: {
+      default: '#121212',
+      paper: '#1e1e1e',
+    },
+  },
+  typography: {
+    fontFamily: '"Roboto", "Helvetica", "Arial", sans-serif',
+  },
+});
+
+function App() {
+  const [systemStatus, setSystemStatus] = useState(null);
+  const [realTimeUpdates, setRealTimeUpdates] = useState([]);
+
+  useEffect(() => {
+    // WebSocket 연결 설정
+    WebSocketService.connect();
+    
+    WebSocketService.onMessage((data) => {
+      setRealTimeUpdates(prev => [...prev.slice(-99), data]);
+      
+      if (data.type === 'status_update') {
+        setSystemStatus(data.data);
+      }
+    });
+
+    return () => {
+      WebSocketService.disconnect();
+    };
+  }, []);
+
+  return (
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <Router>
+        <Box sx={{ display: 'flex', height: '100vh' }}>
+          <Sidebar />
+          <Box component="main" sx={{ flexGrow: 1, p: 3, overflow: 'auto' }}>
+            <Routes>
+              <Route path="/" element={<Navigate to="/dashboard" replace />} />
+              <Route path="/dashboard" element={
+                <Dashboard 
+                  status={systemStatus} 
+                  updates={realTimeUpdates} 
+                />
+              } />
+              <Route path="/goals" element={<Goals />} />
+              <Route path="/tasks" element={<Tasks />} />
+              <Route path="/monitoring" element={<Monitoring />} />
+              <Route path="/settings" element={<Settings />} />
+            </Routes>
+          </Box>
+        </Box>
+      </Router>
+      <Toaster position="top-right" />
+    </ThemeProvider>
+  );
+}
+
+export default App;
+
+// src/components/Dashboard.js
+import React, { useState, useEffect } from 'react';
+import {
+  Grid,
+  Paper,
+  Typography,
+  Box,
+  Card,
+  CardContent,
+  LinearProgress,
+  Chip,
+  List,
+  ListItem,
+  ListItemText,
+  ListItemIcon
+} from '@mui/material';
+import {
+  PlayArrow as PlayIcon,
+  CheckCircle as CheckIcon,
+  Error as ErrorIcon,
+  Schedule as ScheduleIcon
+} from '@mui/icons-material';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { format } from 'date-fns';
+
+import ApiService from '../services/ApiService';
+
+const Dashboard = ({ status, updates }) => {
+  const [metrics, setMetrics] = useState([]);
+  const [recentTasks, setRecentTasks] = useState([]);
+
+  useEffect(() => {
+    fetchDashboardData();
+    const interval = setInterval(fetchDashboardData, 5000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const fetchDashboardData = async () => {
+    try {
+      const [statusData, metricsData] = await Promise.all([
+        ApiService.getStatus(),
+        ApiService.getMetrics()
+      ]);
+      
+      setMetrics(prev => [...prev.slice(-20), {
+        time: format(new Date(), 'HH:mm:ss'),
+        cpu: Math.random() * 100,
+        memory: Math.random() * 8000,
+        tasks: statusData.total_tasks || 0
+      }]);
+      
+      // 최근 작업 업데이트 (시뮬레이션)
+      setRecentTasks([
+        { id: 1, name: 'AI 모델 훈련', status: 'running', progress: 75 },
+        { id: 2, name: '데이터 분석', status: 'completed', progress: 100 },
+        { id: 3, name: '보고서 생성', status: 'pending', progress: 0 },
+        { id: 4, name: '시스템 최적화', status: 'failed', progress: 50 },
+      ]);
+    } catch (error) {
+      console.error('Failed to fetch dashboard data:', error);
+    }
+  };
+
+  const getStatusIcon = (status) => {
+    switch (status) {
+      case 'running': return <PlayIcon color="primary" />;
+      case 'completed': return <CheckIcon color="success" />;
+      case 'failed': return <ErrorIcon color="error" />;
+      default: return <ScheduleIcon color="warning" />;
+    }
+  };
+
+  const getStatusColor = (status) => {
+    switch (status) {
+      case 'running': return 'primary';
+      case 'completed': return 'success';
+      case 'failed': return 'error';
+      default: return 'warning';
+    }
+  };
+
+  return (
+    <Box>
+      <Typography variant="h4" gutterBottom>
+        AutoGPT 대시보드
+      </Typography>
+      
+      <Grid container spacing={3}>
+        {/* 상태 카드들 */}
+        <Grid item xs={12} sm={6} md={3}>
+          <Card>
+            <CardContent>
+              <Typography color="textSecondary" gutterBottom>
+                활성 목표
+              </Typography>
+              <Typography variant="h5">
+                {status?.active_goals || 0}
+              </Typography>
+            </CardContent>
+          </Card>
+        </Grid>
+        
+        <Grid item xs={12} sm={6} md={3}>
+          <Card>
+            <CardContent>
+              <Typography color="textSecondary" gutterBottom>
+                완료된 목표
+              </Typography>
+              <Typography variant="h5">
+                {status?.completed_goals || 0}
+              </Typography>
+            </CardContent>
+          </Card>
+        </Grid>
+        
+        <Grid item xs={12} sm={6} md={3}>
+          <Card>
+            <CardContent>
+              <Typography color="textSecondary" gutterBottom>
+                학습된 패턴
+              </Typography>
+              <Typography variant="h5">
+                {status?.learned_patterns || 0}
+              </Typography>
+            </CardContent>
+          </Card>
+        </Grid>
+        
+        <Grid item xs={12} sm={6} md={3}>
+          <Card>
+            <CardContent>
+              <Typography color="textSecondary" gutterBottom>
+                시스템 상태
+              </Typography>
+              <Chip 
+                label={status?.running ? "실행 중" : "정지됨"}
+                color={status?.running ? "success" : "error"}
+              />
+            </CardContent>
+          </Card>
+        </Grid>
+
+        {/* 성능 차트 */}
+        <Grid item xs={12} md={8}>
+          <Paper sx={{ p: 2 }}>
+            <Typography variant="h6" gutterBottom>
+              시스템 성능
+            </Typography>
+            <ResponsiveContainer width="100%" height={300}>
+              <LineChart data={metrics}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="time" />
+                <YAxis />
+                <Tooltip />
+                <Line 
+                  type="monotone" 
+                  dataKey="cpu" 
+                  stroke="#2196f3" 
+                  name="CPU (%)"
+                />
+                <Line 
+                  type="monotone" 
+                  dataKey="memory" 
+                  stroke="#f50057" 
+                  name="Memory (MB)"
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </Paper>
+        </Grid>
+
+        {/* 최근 작업 */}
+        <Grid item xs={12} md={4}>
+          <Paper sx={{ p: 2 }}>
+            <Typography variant="h6" gutterBottom>
+              최근 작업
+            </Typography>
+            <List>
+              {recentTasks.map((task) => (
+                <ListItem key={task.id}>
+                  <ListItemIcon>
+                    {getStatusIcon(task.status)}
+                  </ListItemIcon>
+                  <ListItemText
+                    primary={task.name}
+                    secondary={
+                      <Box>
+                        <Chip 
+                          size="small" 
+                          label={task.status} 
+                          color={getStatusColor(task.status)}
+                        />
+                        <LinearProgress 
+                          variant="determinate" 
+                          value={task.progress}
+                          sx={{ mt: 1 }}
+                        />
+                      </Box>
+                    }
+                  />
+                </ListItem>
+              ))}
+            </List>
+          </Paper>
+        </Grid>
+
+        {/* 실시간 업데이트 */}
+        <Grid item xs={12}>
+          <Paper sx={{ p: 2 }}>
+            <Typography variant="h6" gutterBottom>
+              실시간 업데이트
+            </Typography>
+            <List sx={{ maxHeight: 200, overflow: 'auto' }}>
+              {updates.slice(-10).reverse().map((update, index) => (
+                <ListItem key={index}>
+                  <ListItemText
+                    primary={`${update.type}: ${JSON.stringify(update.data)}`}
+                    secondary={format(new Date(), 'HH:mm:ss')}
+                  />
+                </ListItem>
+              ))}
+            </List>
+          </Paper>
+        </Grid>
+      </Grid>
+    </Box>
+  );
+};
+
+export default Dashboard;
+
+// src/components/Goals.js
+import React, { useState, useEffect } from 'react';
+import {
+  Box,
+  Typography,
+  Button,
+  Grid,
+  Card,
+  CardContent,
+  CardActions,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
+  TextField,
+  Chip,
+  FormControlLabel,
+  Switch,
+  List,
+  ListItem,
+  ListItemText
+} from '@mui/material';
+import { Add as AddIcon, PlayArrow as PlayIcon } from '@mui/icons-material';
+import toast from 'react-hot-toast';
+
+import ApiService from '../services/ApiService';
+
+const Goals = () => {
+  const [goals, setGoals] = useState([]);
+  const [openDialog, setOpenDialog] = useState(false);
+  const [newGoal, setNewGoal] = useState({
+    description: '',
+    success_criteria: [''],
+    priority: 1,
+    deadline: '',
+    use_llm: true
+  });
+
+  useEffect(() => {
+    fetchGoals();
+  }, []);
+
+  const fetchGoals = async () => {
+    try {
+      const data = await ApiService.getGoals();
+      setGoals(data);
+    } catch (error) {
+      toast.error('목표 목록을 불러오는데 실패했습니다');
+    }
+  };
+
+  const handleCreateGoal = async () => {
+    try {
+      const criteria = newGoal.success_criteria.filter(c => c.trim() !== '');
+      await ApiService.createGoal({
+        ...newGoal,
+        success_criteria: criteria
+      });
+      
+      toast.success('새로운 목표가 생성되었습니다');
+      setOpenDialog(false);
+      setNewGoal({
+        description: '',
+        success_criteria: [''],
+        priority: 1,
+        deadline: '',
+        use_llm: true
+      });
+      fetchGoals();
+    } catch (error) {
+      toast.error('목표 생성에 실패했습니다');
+    }
+  };
+
+  const addCriteria = () => {
+    setNewGoal(prev => ({
+      ...prev,
+      success_criteria: [...prev.success_criteria, '']
+    }));
+  };
+
+  const updateCriteria = (index, value) => {
+    setNewGoal(prev => ({
+      ...prev,
+      success_criteria: prev.success_criteria.map((c, i) => i === index ? value : c)
+    }));
+  };
+
+  const getStatusColor = (status) => {
+    switch (status) {
+      case 'active': return 'primary';
+      case 'completed': return 'success';
+      case 'failed': return 'error';
+      case 'paused': return 'warning';
+      default: return 'default';
+    }
+  };
+
+  return (
+    <Box>
+      <Box display="flex" justifyContent="space-between" alignItems="center" mb={3}>
+        <Typography variant="h4">목표 관리</Typography>
+        <Button
+          variant="contained"
+          startIcon={<AddIcon />}
+          onClick={() => setOpenDialog(true)}
+        >
+          새 목표 추가
+        </Button>
+      </Box>
+
+      <Grid container spacing={3}>
+        {goals.map((goal) => (
+          <Grid item xs={12} md={6} lg={4} key={goal.id}>
+            <Card>
+              <CardContent>
+                <Typography variant="h6" gutterBottom>
+                  {goal.description}
+                </Typography>
+                
+                <Chip 
+                  label={goal.status}
+                  color={getStatusColor(goal.status)}
+                  size="small"
+                  sx={{ mb: 2 }}
+                />
+                
+                <Typography variant="body2" color="textSecondary" gutterBottom>
+                  우선순위: {goal.priority}
+                </Typography>
+                
+                <Typography variant="body2" gutterBottom>
+                  성공 기준:
+                </Typography>
+                <List dense>
+                  {goal.success_criteria.map((criteria, index) => (
+                    <ListItem key={index} sx={{ pl: 0 }}>
+                      <ListItemText 
+                        primary={`• ${criteria}`}
+                        primaryTypographyProps={{ variant: 'body2' }}
+                      />
+                    </ListItem>
+                  ))}
+                </List>
+                
+                {goal.deadline && (
+                  <Typography variant="body2" color="textSecondary">
+                    마감일: {new Date(goal.deadline).toLocaleDateString()}
+                  </Typography>
+                )}
+              </CardContent>
+              
+              <CardActions>
+                <Button 
+                  size="small" 
+                  startIcon={<PlayIcon />}
+                  onClick={() => toast.info('작업 실행 기능 구현 예정')}
+                >
+                  실행
+                </Button>
+              </CardActions>
+            </Card>
+          </Grid>
+        ))}
+      </Grid>
+
+      {/* 새 목표 추가 다이얼로그 */}
+      <Dialog open={openDialog} onClose={() => setOpenDialog(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>새 목표 추가</DialogTitle>
+        <DialogContent>
+          <TextField
+            fullWidth
+            label="목표 설명"
+            margin="normal"
+            value={newGoal.description}
+            onChange={(e) => setNewGoal(prev => ({ ...prev, description: e.target.value }))}
+          />
+          
+          <TextField
+            fullWidth
+            label="우선순위"
+            type="number"
+            margin="normal"
+            inputProps={{ min: 1, max: 5 }}
+            value={newGoal.priority}
+            onChange={(e) => setNewGoal(prev => ({ ...prev, priority: parseInt(e.target.value) }))}
+          />
+          
+          <TextField
+            fullWidth
+            label="마감일"
+            type="datetime-local"
+            margin="normal"
+            InputLabelProps={{ shrink: true }}
+            value={newGoal.deadline}
+            onChange={(e) => setNewGoal(prev => ({ ...prev, deadline: e.target.value }))}
+          />
+          
+          <Typography variant="subtitle2" sx={{ mt: 2, mb: 1 }}>
+            성공 기준
+          </Typography>
+          
+          {newGoal.success_criteria.map((criteria, index) => (
+            <TextField
+              key={index}
+              fullWidth
+              label={`기준 ${index + 1}`}
+              margin="dense"
+              value={criteria}
+              onChange={(e) => updateCriteria(index, e.target.value)}
+            />
+          ))}
+          
+          <Button onClick={addCriteria} sx={{ mt: 1 }}>
+            기준 추가
+          </Button>
+          
+          <FormControlLabel
+            control={
+              <Switch
+                checked={newGoal.use_llm}
+                onChange={(e) => setNewGoal(prev => ({ ...prev, use_llm: e.target.checked }))}
+              />
+            }
+            label="LLM 자동 분해 사용"
+            sx={{ mt: 2 }}
+          />
+        </DialogContent>
+        
+        <DialogActions>
+          <Button onClick={() => setOpenDialog(false)}>취소</Button>
+          <Button onClick={handleCreateGoal} variant="contained">생성</Button>
+        </DialogActions>
+      </Dialog>
+    </Box>
+  );
+};
+
+export default Goals;
+
+// src/services/ApiService.js
+import axios from 'axios';
+
+const API_BASE_URL = process.env.REACT_APP_API_URL || '/api';
+
+class ApiService {
+  constructor() {
+    this.client = axios.create({
+      baseURL: API_BASE_URL,
+      timeout: 10000,
+    });
+
+    this.client.interceptors.response.use(
+      (response) => response.data,
+      (error) => {
+        console.error('API Error:', error);
+        throw error;
+      }
+    );
+  }
+
+  // 목표 관련
+  async getGoals() {
+    return this.client.get('/goals');
+  }
+
+  async createGoal(goalData) {
+    return this.client.post('/goals', goalData);
+  }
+
+  async getGoalTasks(goalId) {
+    return this.client.get(`/goals/${goalId}/tasks`);
+  }
+
+  // 작업 관련
+  async executeTask(taskId) {
+    return this.client.post(`/tasks/${taskId}/execute`);
+  }
+
+  // 시스템 상태
+  async getStatus() {
+    return this.client.get('/status');
+  }
+
+  async getMetrics() {
+    return this.client.get('/metrics');
+  }
+}
+
+export default new ApiService();
+
+// src/services/WebSocketService.js
+import { io } from 'socket.io-client';
+
+class WebSocketService {
+  constructor() {
+    this.socket = null;
+    this.messageHandlers = [];
+  }
+
+  connect() {
+    const wsUrl = process.env.REACT_APP_WS_URL || 'ws://localhost:8000/ws';
+    this.socket = new WebSocket(wsUrl);
+
+    this.socket.onopen = () => {
+      console.log('WebSocket 연결됨');
+    };
+
+    this.socket.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        this.messageHandlers.forEach(handler => handler(data));
+      } catch (error) {
+        console.error('WebSocket 메시지 파싱 오류:', error);
+      }
+    };
+
+    this.socket.onclose = () => {
+      console.log('WebSocket 연결 종료됨');
+      // 자동 재연결
+      setTimeout(() => this.connect(), 5000);
+    };
+
+    this.socket.onerror = (error) => {
+      console.error('WebSocket 오류:', error);
+    };
+  }
+
+  disconnect() {
+    if (this.socket) {
+      this.socket.close();
+      this.socket = null;
+    }
+  }
+
+  onMessage(handler) {
+    this.messageHandlers.push(handler);
+  }
+
+  send(data) {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify(data));
+    }
+  }
+}
+
+export default new WebSocketService();
